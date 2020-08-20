@@ -748,6 +748,7 @@ dependencies = [
  "grpcio",
  "log",
  "protobuf",
+ "rand",
  "tch",
  "thiserror",
 ]

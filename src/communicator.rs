@@ -1,23 +1,37 @@
-use std::sync::Arc;
 use super::communicator_objects as co;
-use co::unity_input::UnityInputProto;
-use co::unity_output::UnityOutputProto;
-use co::unity_to_external_grpc::{UnityToExternalProto, create_unity_to_external_proto};
-use co::unity_message::UnityMessageProto;
 use co::header::HeaderProto;
-use std::sync::mpsc::{channel, Sender, Receiver};
+use co::unity_input::UnityInputProto;
+use co::unity_message::UnityMessageProto;
+use co::unity_output::UnityOutputProto;
+use co::unity_to_external_grpc::{create_unity_to_external_proto, UnityToExternalProto};
 use grpcio::*;
 use protobuf::SingularPtrField;
+use std::sync::mpsc::*;
+use std::sync::Arc;
 
-use thiserror::Error;
-use std::result::Result;
-use std::sync::Mutex;
 use futures::executor::block_on;
+use std::convert::From;
+use std::result::Result;
+use std::sync::mpsc::SendError;
+use std::sync::Mutex;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CommunicatorError {
     #[error("Communicator has exited.")]
-    CommunicatorExited
+    CommunicatorExited,
+}
+
+impl From<RecvError> for CommunicatorError {
+    fn from(_err: RecvError) -> CommunicatorError {
+        CommunicatorError::CommunicatorExited
+    }
+}
+
+impl<T> From<SendError<T>> for CommunicatorError {
+    fn from(_err: SendError<T>) -> CommunicatorError {
+        CommunicatorError::CommunicatorExited
+    }
 }
 
 pub trait Communicator {
@@ -28,15 +42,15 @@ pub trait Communicator {
 
 struct UnityToExternalService {
     to_comm: Arc<Mutex<Sender<UnityMessageProto>>>,
-    from_comm: Arc<Mutex<Receiver<UnityMessageProto>>>
+    from_comm: Arc<Mutex<Receiver<UnityMessageProto>>>,
 }
 
 impl UnityToExternalService {
-    fn create(to_comm: Arc<Mutex<Sender<UnityMessageProto>>>, from_comm: Arc<Mutex<Receiver<UnityMessageProto>>>) -> UnityToExternalService {
-        UnityToExternalService {
-            to_comm,
-            from_comm
-        }
+    fn create(
+        to_comm: Arc<Mutex<Sender<UnityMessageProto>>>,
+        from_comm: Arc<Mutex<Receiver<UnityMessageProto>>>,
+    ) -> UnityToExternalService {
+        UnityToExternalService { to_comm, from_comm }
     }
 }
 
@@ -47,13 +61,25 @@ impl Clone for UnityToExternalService {
 }
 
 impl UnityToExternalProto for UnityToExternalService {
-    fn exchange(&mut self, _ctx: RpcContext, req: UnityMessageProto, sink: UnarySink<UnityMessageProto>) {
+    fn exchange(
+        &mut self,
+        _ctx: RpcContext,
+        req: UnityMessageProto,
+        sink: UnarySink<UnityMessageProto>,
+    ) {
         {
-            self.to_comm.lock().unwrap().send(req);
+            let request_result = self.to_comm.lock().unwrap().send(req);
+            if let Err(e) = request_result {
+                panic!("failed to exchange with GRPC: {:?}", e);
+            }
         }
-        let send_result = self.from_comm.lock().unwrap().recv()
+        let response_result = self
+            .from_comm
+            .lock()
+            .unwrap()
+            .recv()
             .map(|input| sink.success(input));
-        if let Err(e) = send_result {
+        if let Err(e) = response_result {
             panic!("failed to exchange with GRPC: {:?}", e);
         }
     }
@@ -62,14 +88,12 @@ impl UnityToExternalProto for UnityToExternalService {
 pub struct GrpcCommunicator {
     server: Server,
     to_service: Sender<UnityMessageProto>,
-    from_service: Receiver<UnityMessageProto>
+    from_service: Receiver<UnityMessageProto>,
 }
 
 fn build_server(env: Arc<Environment>, port: u16, service: Service) -> Server {
-    let quota = grpcio::ResourceQuota::new(Some("RustyAgentsQuota"))
-        .resize_memory(1024 * 1024);
-    let ch_builder = ChannelBuilder::new(env.clone())
-        .set_resource_quota(quota);
+    let quota = grpcio::ResourceQuota::new(Some("RustyAgentsQuota")).resize_memory(1024 * 1024);
+    let ch_builder = ChannelBuilder::new(env.clone()).set_resource_quota(quota);
 
     let mut server = ServerBuilder::new(env)
         .register_service(service)
@@ -85,34 +109,39 @@ fn build_server(env: Arc<Environment>, port: u16, service: Service) -> Server {
 }
 
 impl GrpcCommunicator {
-    pub fn create() -> GrpcCommunicator {
-        let (to_service, from_comm): (Sender<UnityMessageProto>, Receiver<UnityMessageProto>) = channel();
-        let (to_comm, from_service): (Sender<UnityMessageProto>, Receiver<UnityMessageProto>) = channel();
+    pub fn create(port: u16) -> GrpcCommunicator {
+        let (to_service, from_comm) = channel(); // GRPC service => communicator channel
+        let (to_comm, from_service) = channel(); // communicator => GRPC service channel
         let to_comm = Arc::from(Mutex::from(to_comm));
         let from_comm = Arc::from(Mutex::from(from_comm));
         let service = UnityToExternalService::create(to_comm, from_comm);
         let generic_service = create_unity_to_external_proto(service);
         let env = Arc::new(Environment::new(1));
-        let server = build_server(env, 5004, generic_service);
+        let server = build_server(env, port, generic_service);
         GrpcCommunicator {
             server,
             to_service,
-            from_service
+            from_service,
         }
     }
 }
 
 impl Communicator for GrpcCommunicator {
     fn initialize(&self, inputs: UnityInputProto) -> Result<UnityOutputProto, CommunicatorError> {
-        let mut aca_param = self.from_service
+        let aca_param = self
+            .from_service
             .recv()
             .map(|m| m.unity_output.unwrap())
             .map_err(|_| CommunicatorError::CommunicatorExited);
-        let mut message = UnityMessageProto::default();
-        let mut header = HeaderProto::default();
-        header.status = 200;
-        message.header = SingularPtrField::from(Some(header));
-        message.unity_input = SingularPtrField::from(Some(inputs.clone()));
+        let header = HeaderProto {
+            status: 200,
+            ..HeaderProto::default()
+        };
+        let message = UnityMessageProto {
+            header: SingularPtrField::some(header),
+            unity_input: SingularPtrField::some(inputs.clone()),
+            ..UnityMessageProto::default()
+        };
         let aca_param = aca_param.map(|mut output| {
             output.rl_initialization_output = output.rl_initialization_output.map(|init_params| {
                 println!("Aca params received: {}", init_params.name);
@@ -121,29 +150,43 @@ impl Communicator for GrpcCommunicator {
             output
         });
         println!("Sending initialization response.");
-        self.to_service.send(message);
-        self.from_service.recv();
+        self.to_service.send(message)?;
+        self.from_service.recv()?;
         aca_param
     }
 
     fn exchange(&self, inputs: UnityInputProto) -> Result<UnityOutputProto, CommunicatorError> {
-        let mut message = UnityMessageProto::default();
-        let mut header = HeaderProto::default();
-        header.status = 200;
-        message.header = SingularPtrField::from(Some(header));
-        message.unity_input = SingularPtrField::from(Some(inputs.clone()));
-        self.to_service.send(message);
-        self.from_service.recv()
+        let header = HeaderProto {
+            status: 200,
+            ..HeaderProto::default()
+        };
+        let message = UnityMessageProto {
+            header: SingularPtrField::some(header),
+            unity_input: SingularPtrField::some(inputs.clone()),
+            ..UnityMessageProto::default()
+        };
+        self.to_service.send(message)?;
+        self.from_service
+            .recv()
             .map(|output| output.unity_output.unwrap())
             .map_err(|_| CommunicatorError::CommunicatorExited)
     }
 
     fn close(&mut self) {
-        let mut message = UnityMessageProto::default();
-        let mut header = HeaderProto::default();
-        header.status = 400;
-        message.header = SingularPtrField::from(Some(header));
-        self.to_service.send(message);
-        block_on::<ShutdownFuture>(self.server.shutdown());
+        let header = HeaderProto {
+            status: 400,
+            ..HeaderProto::default()
+        };
+        let message = UnityMessageProto {
+            header: SingularPtrField::some(header),
+            ..UnityMessageProto::default()
+        };
+        self.to_service
+            .send(message)
+            .map_err(|_e| println!("Error sending final message to environment."))
+            .ok();
+        block_on::<ShutdownFuture>(self.server.shutdown())
+            .map_err(|_e| println!("Error shutting down server."))
+            .ok();
     }
 }

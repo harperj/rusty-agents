@@ -1,24 +1,26 @@
 extern crate cpython;
-extern crate tch;
-extern crate grpcio;
 extern crate futures;
-#[macro_use] extern crate log;
-#[macro_use] extern crate thiserror;
-mod environment;
-mod communicator_objects;
+extern crate grpcio;
+extern crate tch;
+#[macro_use]
+extern crate log;
+extern crate thiserror;
+mod behavior;
 mod communicator;
+mod communicator_objects;
+mod environment;
 
-use environment::UnityEnvironment;
 use environment::Environment;
+use environment::UnityEnvironment;
 use std::thread::sleep_ms;
 
 fn main() {
-    let env = UnityEnvironment::default();
+    let mut env = UnityEnvironment::default();
     env.init();
-    for i in 1..10 {
+    for i in 1..1000 {
         println!("Sending step {}", i);
-        env.step();
+        env.step().ok();
         println!("Sent step {}", i);
-        sleep_ms(10000);
+        sleep_ms(1);
     }
 }
